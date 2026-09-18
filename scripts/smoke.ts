@@ -7,6 +7,13 @@ import {
 } from '../src/lib/hosts'
 import { buildDnsmasqLeases, dnsmasqLeasesText } from '../src/lib/dnsmasq'
 import { buildOption121, encodeRoute, resolveClientSegment } from '../src/lib/option121'
+import {
+  buildReverseZones,
+  normalizeAbsoluteDomain,
+  parentZoneOf,
+  rdnsCapableSegments,
+  resolveRdnsSegment,
+} from '../src/lib/rdns'
 import { checkMac, normalizeMacInput } from '../src/lib/mac'
 import { buildExportJson } from '../src/lib/exporter'
 import { intToIp, ipToInt, prefixForHosts } from '../src/lib/ip'
@@ -1520,6 +1527,181 @@ check('关闭模式导出不含重排段', !/基线优先重排/.test(offExport)
 // 19q) 关闭模式后恢复原算法：同输入结果与未启用时字节级一致
 const toggledBack = plan({ ...demo, baseline: null })
 check('关闭重排恢复原算法（字节级）', JSON.stringify(toggledBack) === JSON.stringify(reflowOff))
+
+// ========== 20) 反向 DNS 区域文件 ==========
+// 20a) 绝对域名校验与规范
+check('合法绝对域名通过并规范为小写', (() => {
+  const r = normalizeAbsoluteDomain('Host1.Example.COM')
+  return 'name' in r && r.name === 'host1.example.com'
+})())
+check('显式结尾点（绝对形式）接受并去掉', (() => {
+  const r = normalizeAbsoluteDomain('host1.example.com.')
+  return 'name' in r && r.name === 'host1.example.com'
+})())
+check('空名称拒绝', 'error' in normalizeAbsoluteDomain('   '))
+check('单标签（无域后缀）不是绝对域名', 'error' in normalizeAbsoluteDomain('router'))
+check('连字符开头 / 结尾的标签拒绝', 'error' in normalizeAbsoluteDomain('-bad.example.com') && 'error' in normalizeAbsoluteDomain('bad-.example.com'))
+check('下划线等非法字符拒绝', 'error' in normalizeAbsoluteDomain('host_1.example.com'))
+check('连续点号（空标签）拒绝', 'error' in normalizeAbsoluteDomain('host..example.com'))
+check('单标签超 63 字符拒绝，63 字符通过', 'error' in normalizeAbsoluteDomain(`${'a'.repeat(64)}.example.com`) && 'name' in normalizeAbsoluteDomain(`${'a'.repeat(63)}.example.com`))
+check('总长超 253 字符拒绝，253 字符通过',
+  'error' in normalizeAbsoluteDomain(`${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(63)}.com`) &&
+    'name' in normalizeAbsoluteDomain(`${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`),
+)
+check('parentZoneOf 反转前三个八位组', parentZoneOf(ipToInt('192.168.10.17')) === '10.168.192.in-addr.arpa')
+
+// 20b) 目标网段筛选与解析（示例：q1=128/25、q2=64/26、q3=32/27、q4=16/30）
+const rdnsPlan = plan(demo)
+check('示例 4 个网段均可生成反向区域', rdnsCapableSegments(rdnsPlan).length === 4)
+check('保留区 / 空闲段不能作为目标网段', resolveRdnsSegment(rdnsPlan, 'r1') === null)
+check('空选择 / 已删除需求解析为 null', resolveRdnsSegment(rdnsPlan, '') === null && resolveRdnsSegment(rdnsPlan, 'nope') === null)
+const bigPlan = plan({
+  parentCidr: '10.0.0.0/16',
+  reservations: [],
+  requirements: [{ id: 'big', name: '大网段', hosts: 500, cidr: '' }], // /23
+})
+check('大于 /24 的网段不支持（需拆多个 /24）', rdnsCapableSegments(bigPlan).length === 0 && resolveRdnsSegment(bigPlan, 'big') === null)
+
+// 20c) /24 标准 in-addr.arpa 区域
+const p24Plan = plan({
+  parentCidr: '10.9.0.0/24',
+  reservations: [],
+  requirements: [{ id: 'lan', name: '办公网', hosts: 254, cidr: '' }],
+})
+const p24Seg = resolveRdnsSegment(p24Plan, 'lan')!
+check('/24 网段可作为目标网段', p24Seg.cidr === '10.9.0.0/24')
+const p24Hosts: HostAssignment[] = [
+  { id: 'p1', ownerId: 'lan', name: 'Printer.Office.Example.com', address: ipToInt('10.9.0.20'), mode: 'manual' },
+  { id: 'p2', ownerId: 'lan', name: 'nas.example.com', address: ipToInt('10.9.0.10'), mode: 'manual' },
+]
+const z24 = buildReverseZones(p24Hosts, p24Plan, p24Seg)
+check('/24 无错误且生成 1 份区域文件', z24.errors.length === 0 && z24.files.length === 1 && z24.files[0].kind === 'zone')
+check('/24 区域名为 0.9.10.in-addr.arpa，无子区域', z24.parentZone === '0.9.10.in-addr.arpa' && z24.childZone === null)
+check('/24 记录按 IPv4 升序（.10 在 .20 前，与录入顺序无关）', z24.entries.map((e) => e.ip).join(',') === '10.9.0.10,10.9.0.20')
+check(
+  '/24 区域文本：$ORIGIN + 末位为所有者名的 PTR 记录（目标以结尾点写出、统一小写）',
+  z24.files[0].text === [
+    '; 反向 DNS 区域文件（PTR 记录）',
+    '; 网段：10.9.0.0/24（办公网）',
+    '; 区域：0.9.10.in-addr.arpa',
+    '$ORIGIN 0.9.10.in-addr.arpa.',
+    '10 IN PTR   nas.example.com.',
+    '20 IN PTR   printer.office.example.com.',
+  ].join('\n'),
+  z24.files[0].text,
+)
+check('/24 文件记录数与区域名正确', z24.files[0].records === 2 && z24.files[0].zone === '0.9.10.in-addr.arpa')
+
+// 20d) /30 按 RFC 2317 生成父区域 CNAME + 子区域 PTR 两段文本
+const q4Seg = resolveRdnsSegment(rdnsPlan, 'q4')!
+const rdnsHosts: HostAssignment[] = [
+  { id: 'r1h', ownerId: 'q4', name: 'gw.example.com', address: ipToInt('192.168.10.17'), mode: 'auto' },
+  { id: 'r2h', ownerId: 'q4', name: 'sw.example.com', address: ipToInt('192.168.10.18'), mode: 'manual' },
+]
+const z30 = buildReverseZones(rdnsHosts, rdnsPlan, q4Seg)
+check('/30 无错误且生成父区域 + 子区域两份文本', z30.errors.length === 0 && z30.files.length === 2)
+check('子区域以网段起止末位命名（16-19）', z30.childZone === '16-19.10.168.192.in-addr.arpa')
+check(
+  '/30 父区域 CNAME 片段文本正确',
+  z30.files[0].kind === 'parent' &&
+    z30.files[0].zone === '10.168.192.in-addr.arpa' &&
+    z30.files[0].text === [
+      '; RFC 2317 父区域 CNAME 片段',
+      '; 网段：192.168.10.16/30（管理）',
+      '; 将以下记录并入父区域 10.168.192.in-addr.arpa',
+      '$ORIGIN 10.168.192.in-addr.arpa.',
+      '17 IN CNAME 17.16-19.10.168.192.in-addr.arpa.',
+      '18 IN CNAME 18.16-19.10.168.192.in-addr.arpa.',
+    ].join('\n'),
+  z30.files[0].text,
+)
+check(
+  '/30 子区域 PTR 文件文本正确',
+  z30.files[1].kind === 'child' &&
+    z30.files[1].zone === '16-19.10.168.192.in-addr.arpa' &&
+    z30.files[1].text === [
+      '; RFC 2317 子区域文件（PTR 记录）',
+      '; 网段：192.168.10.16/30（管理）',
+      '; 子区域：16-19.10.168.192.in-addr.arpa',
+      '$ORIGIN 16-19.10.168.192.in-addr.arpa.',
+      '17 IN PTR   gw.example.com.',
+      '18 IN PTR   sw.example.com.',
+    ].join('\n'),
+  z30.files[1].text,
+)
+
+// 20e) /25 子区域末位命名与 CNAME 指向
+const q1Seg = resolveRdnsSegment(rdnsPlan, 'q1')!
+const z25 = buildReverseZones(
+  [{ id: 'o1', ownerId: 'q1', name: 'pc1.example.com', address: ipToInt('192.168.10.129'), mode: 'auto' }],
+  rdnsPlan,
+  q1Seg,
+)
+check('/25 子区域末位为 128-255', z25.childZone === '128-255.10.168.192.in-addr.arpa')
+check('/25 父区域 CNAME 指向子区域', z25.files[0].text.includes('129 IN CNAME 129.128-255.10.168.192.in-addr.arpa.'), z25.files[0].text)
+
+// 20f) 不合法名称逐条报错并停止整体生成
+const badName = buildReverseZones(
+  [
+    { id: 'b1', ownerId: 'q4', name: 'gateway', address: ipToInt('192.168.10.17'), mode: 'auto' },
+    { id: 'b2', ownerId: 'q4', name: 'ok.example.com', address: ipToInt('192.168.10.18'), mode: 'manual' },
+  ],
+  rdnsPlan,
+  q4Seg,
+)
+check('不合法名称产生 1 条错误且停止整体生成（无文件）', badName.errors.length === 1 && badName.files.length === 0)
+check('错误定位到第 1 条及其 IP', badName.errors[0].index === 1 && badName.errors[0].ip === '192.168.10.17' && /不是绝对域名/.test(badName.errors[0].message), JSON.stringify(badName.errors))
+check('合法条目自身无错且域名已规范', badName.entries[1].domain === 'ok.example.com' && badName.entries[1].errors.length === 0)
+
+// 20g) 重复域名（大小写归一后）逐条报错并停止整体生成
+const dupName = buildReverseZones(
+  [
+    { id: 'd1', ownerId: 'q4', name: 'gw.example.com', address: ipToInt('192.168.10.17'), mode: 'auto' },
+    { id: 'd2', ownerId: 'q4', name: 'GW.Example.COM', address: ipToInt('192.168.10.18'), mode: 'manual' },
+  ],
+  rdnsPlan,
+  q4Seg,
+)
+check('重复域名产生 1 条错误且停止整体生成', dupName.errors.length === 1 && dupName.files.length === 0)
+check('重复错误定位到第 2 条并指向第 1 条（192.168.10.17）', dupName.errors[0].index === 2 && /第 1 条/.test(dupName.errors[0].message) && /192\.168\.10\.17/.test(dupName.errors[0].message), JSON.stringify(dupName.errors))
+
+// 20h) 失效登记（越界）不参与生成也不报错
+const withInvalid = buildReverseZones(
+  [
+    { id: 'v1', ownerId: 'q4', name: 'gw.example.com', address: ipToInt('192.168.10.17'), mode: 'auto' },
+    { id: 'v2', ownerId: 'q4', name: 'not a domain at all', address: ipToInt('192.168.10.40'), mode: 'manual' }, // 越界失效
+  ],
+  rdnsPlan,
+  q4Seg,
+)
+check('失效登记不参与生成也不报错', withInvalid.errors.length === 0 && withInvalid.entries.length === 1 && withInvalid.files.length === 2)
+
+// 20i) 网段迁移后实时重算：子区域按新起止末位命名；旧地址登记自动撤出
+const q4Moved = resolveRdnsSegment(migratedPlan, 'q4')!
+check('迁移后目标网段解析跟随新网段 20/30', q4Moved.cidr === '192.168.10.20/30')
+const zMoved = buildReverseZones(
+  [{ id: 'm1h', ownerId: 'q4', name: 'gw.example.com', address: ipToInt('192.168.10.21'), mode: 'auto' }],
+  migratedPlan,
+  q4Moved,
+)
+check('迁移后子区域重算为 20-23 且无错误', zMoved.childZone === '20-23.10.168.192.in-addr.arpa' && zMoved.errors.length === 0 && zMoved.files.length === 2)
+const stale = buildReverseZones(
+  [{ id: 'm1h', ownerId: 'q4', name: 'gw.example.com', address: ipToInt('192.168.10.17'), mode: 'auto' }],
+  migratedPlan,
+  q4Moved,
+)
+check('迁移后失效旧登记自动撤出（无条目、无错误、无文件）', stale.entries.length === 0 && stale.errors.length === 0 && stale.files.length === 0)
+
+// 20j) 无登记时无错误、无文件
+const emptyRdns = buildReverseZones([], rdnsPlan, q4Seg)
+check('无登记时无错误、无文件', emptyRdns.errors.length === 0 && emptyRdns.entries.length === 0 && emptyRdns.files.length === 0)
+
+// 20k) 只读性：生成不修改规划与登记，也不进入 JSON 导出
+const planBefore = JSON.stringify(rdnsPlan)
+const hostsBefore = JSON.stringify(rdnsHosts)
+buildReverseZones(rdnsHosts, rdnsPlan, q4Seg)
+check('生成不修改规划结果与主机登记', JSON.stringify(rdnsPlan) === planBefore && JSON.stringify(rdnsHosts) === hostsBefore)
+check('导出 JSON 不含反向 DNS 内容', !/in-addr|PTR|CNAME/.test(buildExportJson(rdnsPlan, { parentCidr: demo.parentCidr })))
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)
 process.exit(failures === 0 ? 0 : 1)

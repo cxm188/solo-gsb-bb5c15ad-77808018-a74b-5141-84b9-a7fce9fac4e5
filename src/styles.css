@@ -1369,3 +1369,58 @@ button.host-mac-edit:hover {
 .reflow-report .table-heading {
   margin-top: 8px;
 }
+
+/* ---------- 反向 DNS 区域文件 ---------- */
+.rdns-panel {
+  border-color: rgba(167, 139, 250, 0.35);
+}
+
+.rdns-segment-row {
+  margin-bottom: 12px;
+}
+
+.rdns-zone-meta {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: #7dd3fc;
+}
+
+.rdns-entry-table {
+  margin-bottom: 12px;
+}
+
+.rdns-idx {
+  width: 36px;
+  color: var(--muted);
+}
+
+.rdns-ok-tag {
+  color: #6ee7b7;
+  font-size: 12px;
+}
+
+.rdns-file {
+  background: var(--panel-2);
+  border: 1px solid rgba(167, 139, 250, 0.35);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-top: 12px;
+}
+
+.rdns-file-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.rdns-file-head h3 {
+  font-size: 14px;
+  margin: 0;
+}
