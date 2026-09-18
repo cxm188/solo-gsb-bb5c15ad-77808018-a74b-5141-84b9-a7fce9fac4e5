@@ -6,6 +6,15 @@ import {
   validateManualAddress,
 } from '../src/lib/hosts'
 import { buildDnsmasqLeases, dnsmasqLeasesText } from '../src/lib/dnsmasq'
+import {
+  buildReverseDns,
+  childZoneName,
+  classifyDeviceName,
+  parentZoneName,
+  PLACEHOLDER_NS,
+  PLACEHOLDER_RNAME,
+  resolveReverseSegment,
+} from '../src/lib/reverseDns'
 import { buildOption121, encodeRoute, resolveClientSegment } from '../src/lib/option121'
 import { checkMac, normalizeMacInput } from '../src/lib/mac'
 import { buildExportJson } from '../src/lib/exporter'
@@ -1520,6 +1529,262 @@ check('关闭模式导出不含重排段', !/基线优先重排/.test(offExport)
 // 19q) 关闭模式后恢复原算法：同输入结果与未启用时字节级一致
 const toggledBack = plan({ ...demo, baseline: null })
 check('关闭重排恢复原算法（字节级）', JSON.stringify(toggledBack) === JSON.stringify(reflowOff))
+
+// ========== 20) 反向 DNS 区域文件（in-addr.arpa / RFC 2317） ==========
+// 20a) 设备名分类：合法绝对域名 / 单标签跳过 / 不合法名称报错
+check(
+  '合法 FQDN 归一为小写带根尾点',
+  classifyDeviceName('GW.Example.COM').kind === 'fqdn' &&
+    (classifyDeviceName('GW.Example.COM') as { fqdn: string }).fqdn === 'gw.example.com.',
+)
+check('带合法连字符标签通过', classifyDeviceName('core-sw-1.site-a.example.net').kind === 'fqdn')
+check('允许数字开头的标签（如 3par / r2d2）', classifyDeviceName('3par.example.com').kind === 'fqdn')
+check('单个根尾点形式接受并归一',
+  classifyDeviceName('host.example.com.').kind === 'fqdn' &&
+    (classifyDeviceName('host.example.com.') as { fqdn: string }).fqdn === 'host.example.com.')
+check('单标签中文名跳过（并非域名）', classifyDeviceName('网关').kind === 'skip')
+check('单标签英文名跳过', classifyDeviceName('core-sw').kind === 'skip')
+check('空名称跳过', classifyDeviceName('   ').kind === 'skip')
+check('中文多标签名称非法（非 ASCII）', classifyDeviceName('路由.例.中国').kind === 'error')
+check('含下划线的标签非法', classifyDeviceName('my_host.example.com').kind === 'error')
+check('连字符开头标签非法', classifyDeviceName('-bad.example.com').kind === 'error')
+check('连字符结尾标签非法', classifyDeviceName('bad-.example.com').kind === 'error')
+check('连续点（空标签）非法', classifyDeviceName('host..example.com').kind === 'error')
+check('多个根尾点非法', classifyDeviceName('host.example.com..').kind === 'error')
+check('含空格非法', classifyDeviceName('host .example.com').kind === 'error')
+check('纯数字顶级标签非法', classifyDeviceName('host.123').kind === 'error')
+check(
+  '超长标签非法（>63）',
+  classifyDeviceName(`${'a'.repeat(64)}.example.com`).kind === 'error',
+)
+check('超长全名非法（>253）', classifyDeviceName(`${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(62)}`).kind === 'error',
+  String(`${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(62)}`.length))
+check('长度恰为 253 的多标签名称合法', classifyDeviceName(`${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`).kind === 'fqdn')
+
+// 20b) 父/子区域命名
+check(
+  '父区域名为前 3 字节反序',
+  parentZoneName(ipToInt('192.168.10.16')) === '10.168.192.in-addr.arpa',
+  parentZoneName(ipToInt('192.168.10.16')),
+)
+const rdnsMgmt = allocatableSegments(hostPlan).find((s) => s.ownerId === 'q4')! // 192.168.10.16/30
+check('网段解析：q4=16/30', resolveReverseSegment(hostPlan, 'q4')?.cidr === '192.168.10.16/30')
+check('保留区/空选择不能解析', resolveReverseSegment(hostPlan, 'r1') === null && resolveReverseSegment(hostPlan, '') === null)
+check(
+  'RFC 2317 子区域以起止末位命名：16-19',
+  childZoneName(rdnsMgmt) === '16-19.10.168.192.in-addr.arpa',
+  childZoneName(rdnsMgmt),
+)
+
+// 20c) /24 标准区域：PTR 按 IP 升序、占位 SOA/NS、序列号
+const plan24 = plan({
+  parentCidr: '192.168.20.0/24',
+  reservations: [],
+  requirements: [{ id: 'n1', name: '业务段', hosts: 200, cidr: '' }], // 192.168.20.0/24
+})
+check('/24 规划成功', plan24.inputErrors.length === 0 && plan24.segments.some((s) => s.ownerId === 'n1' && s.prefix === 24))
+const list24: HostAssignment[] = [
+  { id: 'd1', ownerId: 'n1', name: 'www.example.com', address: ipToInt('192.168.20.20'), mode: 'manual' },
+  { id: 'd2', ownerId: 'n1', name: 'GW.EXAMPLE.COM', address: ipToInt('192.168.20.1'), mode: 'auto' },
+  { id: 'd3', ownerId: 'n1', name: '打印机', address: ipToInt('192.168.20.50'), mode: 'manual' }, // 单标签跳过
+  { id: 'd4', ownerId: 'n1', name: 'mail.example.com', address: ipToInt('192.168.20.10'), mode: 'manual' },
+]
+const built24 = buildReverseDns(list24, plan24, 'n1', { serial: '2026091800' })
+check('/24 识别为 classful 模式', built24?.mode === 'classful' && built24.supported)
+check('父区域名 20.168.192.in-addr.arpa', built24?.parentZone === '20.168.192.in-addr.arpa')
+check('3 条 FQDN 纳入、1 条单标签跳过', built24?.entries.length === 3 && built24?.skipped.length === 1, JSON.stringify({ e: built24?.entries.length, s: built24?.skipped.length }))
+check('无错误时生成区域文本', built24?.zoneText !== '' && built24?.errors.length === 0)
+check(
+  '结果按 IP 升序（.1, .10, .20），与录入顺序无关',
+  built24!.entries.map((e) => e.ip).join(',') === '192.168.20.1,192.168.20.10,192.168.20.20',
+  built24!.entries.map((e) => e.ip).join(','),
+)
+check(
+  'PTR 记录文本（owner 宽 4 列、大写归一为小写）',
+  built24!.zoneText.includes('1    IN  PTR   gw.example.com.') &&
+    built24!.zoneText.includes('10   IN  PTR   mail.example.com.') &&
+    built24!.zoneText.includes('20   IN  PTR   www.example.com.'),
+  built24!.zoneText,
+)
+check('单标签设备名不出现在区域文本中', !/打印机|^50/m.test(built24!.zoneText) && !built24!.zoneText.includes('50   IN  PTR'))
+check('区域文本含 $ORIGIN/$TTL/SOA/NS 占位与序列号',
+  built24!.zoneText.includes('$ORIGIN 20.168.192.in-addr.arpa.') &&
+    built24!.zoneText.includes('$TTL 86400') &&
+    built24!.zoneText.includes('SOA') &&
+    built24!.zoneText.includes(PLACEHOLDER_NS) &&
+    built24!.zoneText.includes(PLACEHOLDER_RNAME) &&
+    built24!.zoneText.includes('2026091800'),
+)
+check('默认序列号为 10 位 YYYYMMDDnn', /^\d{10}$/.test(buildReverseDns(list24, plan24, 'n1')!.serial))
+
+// 20d) RFC 2317：/30 生成父区域 CNAME + 子区域 PTR 两段，子区域 16-19
+const list30: HostAssignment[] = [
+  { id: 'm1', ownerId: 'q4', name: 'rt1.example.com', address: ipToInt('192.168.10.18'), mode: 'manual' },
+  { id: 'm2', ownerId: 'q4', name: 'rt0.example.com', address: ipToInt('192.168.10.17'), mode: 'auto' },
+]
+const built30 = buildReverseDns(list30, hostPlan, 'q4', { serial: '2026091800' })
+check('/30 识别为 rfc2317 模式', built30?.mode === 'rfc2317' && built30.supported)
+check('/30 子区域 16-19.10.168.192.in-addr.arpa', built30?.childZone === '16-19.10.168.192.in-addr.arpa')
+check('/30 不产生 classful zoneText', built30!.zoneText === '' && built30!.parentText !== '' && built30!.childText !== '')
+check(
+  '父区域 CNAME 行（按 IP 升序，目标为 <末位>.<子区域>.）',
+  built30!.parentText!.includes('17   IN  CNAME 17.16-19.10.168.192.in-addr.arpa.') &&
+    built30!.parentText!.includes('18   IN  CNAME 18.16-19.10.168.192.in-addr.arpa.'),
+  built30!.parentText,
+)
+check(
+  '子区域 PTR 行（按 IP 升序）',
+  built30!.childText!.includes('17   IN  PTR   rt0.example.com.') &&
+    built30!.childText!.includes('18   IN  PTR   rt1.example.com.'),
+  built30!.childText,
+)
+check('父片段含 NS 委派注释与子区域名',
+  built30!.parentText!.includes('IN  NS') && built30!.parentText!.includes('16-19'),
+)
+check('子区域文件含 $ORIGIN 与 SOA/NS 占位',
+  built30!.childText!.includes('$ORIGIN 16-19.10.168.192.in-addr.arpa.') &&
+    built30!.childText!.includes('SOA') && built30!.childText!.includes(PLACEHOLDER_NS),
+)
+
+// 20e) RFC 2317 各前缀子区域命名（/25 与 /27）
+const plan25 = plan({
+  parentCidr: '10.50.0.0/24',
+  reservations: [],
+  requirements: [{ id: 'h', name: '半段', hosts: 120, cidr: '' }], // 10.50.0.0/25
+})
+check('/25 规划成功', plan25.segments.some((s) => s.ownerId === 'h' && s.cidr === '10.50.0.0/25'))
+check(
+  '/25 子区域 0-127.0.50.10.in-addr.arpa',
+  buildReverseDns([], plan25, 'h')!.childZone === '0-127.0.50.10.in-addr.arpa',
+)
+const plan27 = plan({
+  parentCidr: '172.16.9.0/24',
+  reservations: [],
+  requirements: [{ id: 'f', name: '固定小段', hosts: 20, cidr: '172.16.9.96/27' }], // 96~127
+})
+check(
+  '/27 固定段子区域 96-127.9.16.172.in-addr.arpa',
+  buildReverseDns([], plan27, 'f')!.childZone === '96-127.9.16.172.in-addr.arpa',
+  buildReverseDns([], plan27, 'f')!.childZone,
+)
+
+// 20f) 重复域名：第二条报错、明确定位、停止整体生成
+const dupFqdn: HostAssignment[] = [
+  { id: 'a', ownerId: 'q4', name: 'host.example.com', address: ipToInt('192.168.10.17'), mode: 'manual' },
+  { id: 'b', ownerId: 'q4', name: 'HOST.example.COM', address: ipToInt('192.168.10.18'), mode: 'manual' },
+]
+const dupBuilt = buildReverseDns(dupFqdn, hostPlan, 'q4')
+check('重复域名（忽略大小写/尾点）产生 1 条错误', dupBuilt!.errors.length === 1, JSON.stringify(dupBuilt!.errors))
+check('错误定位到第 2 条并指向第 1 条',
+  dupBuilt!.errors[0].index === 2 && /第 1 条/.test(dupBuilt!.errors[0].message) && /host\.example\.com\./.test(dupBuilt!.errors[0].message),
+  JSON.stringify(dupBuilt!.errors),
+)
+check('有错停止生成：所有区域文本为空', dupBuilt!.zoneText === '' && dupBuilt!.parentText === '' && dupBuilt!.childText === '')
+check('有错时仍按 IP 升序保留首条有效行预览', dupBuilt!.entries.length === 1 && dupBuilt!.entries[0].ip === '192.168.10.17')
+
+// 20g) 不合法名称：逐条报错（可多条）并停止生成；有效行仍预览
+const badNames: HostAssignment[] = [
+  { id: 'a', ownerId: 'q4', name: 'good.example.com', address: ipToInt('192.168.10.17'), mode: 'manual' },
+  { id: 'b', ownerId: 'q4', name: 'bad_host.example.com', address: ipToInt('192.168.10.18'), mode: 'manual' },
+]
+const badBuilt = buildReverseDns(badNames, hostPlan, 'q4')
+check('非法名称产生错误且区域不输出', badBuilt!.errors.length === 1 && badBuilt!.parentText === '' && badBuilt!.childText === '')
+check('错误信息含原始名称与原因', /bad_host\.example\.com/.test(badBuilt!.errors[0].message) && /不合法/.test(badBuilt!.errors[0].message))
+const multiBad: HostAssignment[] = [
+  { id: 'a', ownerId: 'q4', name: 'a..example.com', address: ipToInt('192.168.10.17'), mode: 'manual' },
+  { id: 'b', ownerId: 'q4', name: '路由.例', address: ipToInt('192.168.10.18'), mode: 'manual' },
+]
+const multiBadBuilt = buildReverseDns(multiBad, hostPlan, 'q4')
+check('多个非法名称逐条报错（2 条）', multiBadBuilt!.errors.length === 2 && multiBadBuilt!.errors.map((e) => e.index).join(',') === '1,2')
+
+// 20h) 失效登记不读取：网段迁移后越界登记进入 excluded 而非错误，其他有效登记仍生成
+const rdnsMigratedList: HostAssignment[] = [
+  { id: 'x1', ownerId: 'q4', name: 'old.example.com', address: ipToInt('192.168.10.17'), mode: 'auto' },
+]
+const migratedBuilt = buildReverseDns(rdnsMigratedList, migratedPlan, 'q4', { serial: '2026091800' })
+check('迁移后 q4=20/30，原 .17 登记失效不被读取',
+  migratedBuilt!.segment.cidr === '192.168.10.20/30' &&
+    migratedBuilt!.excluded.length === 1 &&
+    migratedBuilt!.entries.length === 0 &&
+    migratedBuilt!.errors.length === 0,
+  JSON.stringify({ c: migratedBuilt!.segment.cidr, x: migratedBuilt!.excluded.length }),
+)
+check('失效登记不阻断：无有效条目时区域为空（而非报错）', migratedBuilt!.parentText === '' && migratedBuilt!.childText === '')
+// 迁移后在新网段补一条合法登记即可恢复生成
+const migratedRecover = buildReverseDns(
+  [
+    ...rdnsMigratedList,
+    { id: 'x2', ownerId: 'q4', name: 'new.example.com', address: ipToInt('192.168.10.21'), mode: 'manual' },
+  ],
+  migratedPlan,
+  'q4',
+)
+check('迁移后新址合法登记实时纳入（.21），旧登记留在 excluded',
+  migratedRecover!.entries.map((e) => e.ip).join(',') === '192.168.10.21' && migratedRecover!.excluded.length === 1,
+)
+check('实时重算：改址回新网段可用范围后重新纳入',
+  buildReverseDns(
+    [{ id: 'x1', ownerId: 'q4', name: 'old.example.com', address: ipToInt('192.168.10.22'), mode: 'manual' }],
+    migratedPlan,
+    'q4',
+  )!.entries.length === 1,
+)
+
+// 20i) 网络/广播地址登记（数据层异常）不进入输出
+const edgeAddrBuilt = buildReverseDns(
+  [{ id: 'e', ownerId: 'q4', name: 'edge.example.com', address: ipToInt('192.168.10.16'), mode: 'manual' }],
+  hostPlan,
+  'q4',
+)
+check('网络地址登记被排除不生成', edgeAddrBuilt!.excluded.length === 1 && edgeAddrBuilt!.entries.length === 0)
+
+// 20j) 无有效条目：不报错、文本为空
+check('空登记列表无错误无文本', (() => {
+  const b = buildReverseDns([], hostPlan, 'q4')!
+  return b.errors.length === 0 && b.parentText === '' && b.childText === '' && b.entries.length === 0
+})())
+check('仅有单标签名：全部跳过、无错误无文本', (() => {
+  const b = buildReverseDns(
+    [{ id: 's', ownerId: 'q4', name: '网关', address: ipToInt('192.168.10.17'), mode: 'auto' }],
+    hostPlan,
+    'q4',
+  )!
+  return b.skipped.length === 1 && b.entries.length === 0 && b.errors.length === 0 && b.parentText === ''
+})())
+
+// 20k) 网段选择失效 -> resolveReverseSegment 为 null（面板暂停，选择由上层保留）
+check('需求删除后解析为 null', resolveReverseSegment(q4Deleted, 'q4') === null)
+check('buildReverseDns 对失效网段返回 null', buildReverseDns(list30, q4Deleted, 'q4') === null)
+
+// 20l) 前缀范围：仅 /24 与 /25～/30 支持
+const plan23 = plan({
+  parentCidr: '10.20.0.0/22',
+  reservations: [],
+  requirements: [{ id: 'big', name: '大固定段', hosts: 500, cidr: '10.20.0.0/23' }],
+})
+const built23 = buildReverseDns([], plan23, 'big')
+check('/23 不支持并给出原因（大于 /24）', built23!.supported === false && built23!.mode === 'classful' && /超出单个/.test(built23!.unsupportedReason ?? ''))
+
+// 20m) 跨网段隔离：重复域名在不同网段间互不影响（按所选网段独立生成）
+const crossList: HostAssignment[] = [
+  { id: 'a', ownerId: 'q1', name: 'gw.example.com', address: ipToInt('192.168.10.129'), mode: 'auto' },
+  { id: 'b', ownerId: 'q4', name: 'gw.example.com', address: ipToInt('192.168.10.17'), mode: 'auto' },
+]
+check('不同网段同名域名各自生成无重复错误',
+  buildReverseDns(crossList, hostPlan, 'q1')!.errors.length === 0 &&
+    buildReverseDns(crossList, hostPlan, 'q4')!.errors.length === 0,
+)
+check('其他网段的登记不出现在所选网段输出中',
+  buildReverseDns(crossList, hostPlan, 'q4')!.entries.every((e) => e.assignment.ownerId === 'q4'),
+)
+
+// 20n) 只读隔离：反向 DNS 不修改规划/登记，且导出 JSON 不含反向区域内容
+check('反向 DNS 不改动登记数组', (() => {
+  const snapshot = JSON.stringify(crossList)
+  buildReverseDns(crossList, hostPlan, 'q4', { serial: '2026091800' })
+  return JSON.stringify(crossList) === snapshot
+})())
+check('导出 JSON 不含 in-addr.arpa / PTR 内容', !/in-addr\.arpa|PTR/.test(buildExportJson(hostPlan, { parentCidr: demo.parentCidr })))
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)
 process.exit(failures === 0 ? 0 : 1)

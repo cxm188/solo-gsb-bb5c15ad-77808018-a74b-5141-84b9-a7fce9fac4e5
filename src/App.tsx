@@ -4,6 +4,7 @@ import BaselinePanel from './components/BaselinePanel'
 import HostAddressPanel from './components/HostAddressPanel'
 import Option121Panel from './components/Option121Panel'
 import { ReflowSummaryBar } from './components/ReflowReport'
+import ReverseDnsPanel from './components/ReverseDnsPanel'
 import RouteSummaryPanel from './components/RouteSummaryPanel'
 import SegmentDetail from './components/SegmentDetail'
 import SegmentTable from './components/SegmentTable'
@@ -57,6 +58,8 @@ export default function App() {
   // DHCP Option 121：客户端网段（需求稳定 ID）+ 路由录入（行内稳定 ID，规划变化后保留并重新校验）
   const [option121ClientId, setOption121ClientId] = useState('')
   const [option121Routes, setOption121Routes] = useState<Option121RouteInput[]>([])
+  // 反向 DNS 区域文件：所选网段（需求稳定 ID）；登记复用主机地址分配面板数据，只读不修改
+  const [reverseDnsOwnerId, setReverseDnsOwnerId] = useState('')
 
   // 重排生效条件：有基线、父网段为规范 CIDR 且与基线完全一致（输入非法/父网段变化时禁用）
   const parentForReflow = useMemo(() => {
@@ -122,6 +125,7 @@ export default function App() {
     setHostAssignments([])
     setOption121ClientId('')
     setOption121Routes([])
+    setReverseDnsOwnerId('')
   }
 
   function clearAll() {
@@ -132,6 +136,7 @@ export default function App() {
     setHostAssignments([])
     setOption121ClientId('')
     setOption121Routes([])
+    setReverseDnsOwnerId('')
   }
 
   const hasInput =
@@ -354,6 +359,13 @@ export default function App() {
         routes={option121Routes}
         onClientChange={setOption121ClientId}
         onRoutesChange={setOption121Routes}
+      />
+
+      <ReverseDnsPanel
+        result={result}
+        assignments={hostAssignments}
+        ownerId={reverseDnsOwnerId}
+        onOwnerChange={setReverseDnsOwnerId}
       />
 
       {result.segments.length > 0 && (

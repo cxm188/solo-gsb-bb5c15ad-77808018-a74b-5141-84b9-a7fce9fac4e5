@@ -1269,6 +1269,50 @@ button.host-mac-edit:hover {
 }
 
 
+/* ---------- 反向 DNS 区域文件 ---------- */
+
+.rdns-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 12px;
+}
+
+.rdns-chip {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.rdns-chip strong {
+  color: #e2e8f0;
+}
+
+.rdns-ok {
+  color: #4ade80;
+  font-size: 12px;
+}
+
+.rdns-skip {
+  color: #fbbf24;
+  font-size: 12px;
+  cursor: help;
+}
+
+tr.rdns-skip-row td {
+  opacity: 0.85;
+}
+
+.rdns-block + .rdns-block {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+}
+
+
 /* ---------- 基线优先重排 ---------- */
 
 .reflow-toggle {
